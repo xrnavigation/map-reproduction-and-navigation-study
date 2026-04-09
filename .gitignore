@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache artifacts
+.pytest_cache/
+
+# Temporary office files
+~$*
