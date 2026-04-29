@@ -5,6 +5,7 @@ so the pipeline logic stays readable and testable.
 """
 
 import math
+import warnings
 from typing import Sequence
 
 import geopandas as gpd
@@ -49,7 +50,9 @@ def compute_orientation_angle(geom: BaseGeometry) -> float:
 
     if "Polygon" in gtype:
         # Estimate polygon orientation from its minimum rotated rectangle.
-        rect = geom.minimum_rotated_rectangle
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            rect = geom.minimum_rotated_rectangle
         if "Polygon" in rect.geom_type:
             coords = list(rect.exterior.coords)
             best = None
@@ -97,7 +100,7 @@ def ratio_similarity(a: float, b: float) -> float:
     return max(0.0, 1.0 - abs(a - b) / max(a, b))
 
 
-def safe_mean(values: Sequence[float], default: float = 1.0) -> float:
+def safe_mean(values: Sequence[float], default: float = 0.0) -> float:
     """Mean with explicit fallback for empty collections."""
     return sum(values) / len(values) if values else default
 

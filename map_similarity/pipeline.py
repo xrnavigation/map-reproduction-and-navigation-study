@@ -12,12 +12,12 @@ import re
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import geopandas as gpd
 import pandas as pd
 
-from .constants import BASELINE_DIR, BLIND_DIR, RESULTS_XLSX, SIGHTED_DIR
+from .constants import ANALYSIS_DIR, BASELINE_DIR, BLIND_DIR, RESULTS_XLSX, SIGHTED_DIR
 from .metrics import (
     bearing_between_points,
     compute_orientation_angle,
@@ -41,6 +41,22 @@ def infer_map_number(file_path: Path) -> Optional[int]:
     """Parse map id from participant filename."""
     match = re.search(r"_map_(\d+)\.geojson$", file_path.name, flags=re.IGNORECASE)
     return int(match.group(1)) if match else None
+
+
+def parse_map_number(value: object) -> Optional[int]:
+    """Parse map id from spreadsheet values such as 'Map 2'."""
+    if pd.isna(value):
+        return None
+    match = re.search(r"map\s*(\d+)", str(value), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def normalize_participant_id(value: object) -> Optional[str]:
+    """Normalize spreadsheet participant labels to folder ids like 'p7'."""
+    if pd.isna(value):
+        return None
+    match = re.search(r"p\s*(\d+)", str(value), flags=re.IGNORECASE)
+    return f"p{int(match.group(1))}" if match else None
 
 
 def load_geojson_features(path: Path) -> gpd.GeoDataFrame:
@@ -69,6 +85,85 @@ def load_geojson_features(path: Path) -> gpd.GeoDataFrame:
     gdf["geom_type"] = gdf.geometry.geom_type
     gdf["centroid_y"] = gdf.geometry.centroid.y
     return gdf
+
+
+def non_grid_feature_names(gdf: gpd.GeoDataFrame) -> Set[str]:
+    """Unique normalized feature names after removing grid scaffolding."""
+    if gdf.empty or "name_norm" not in gdf.columns:
+        return set()
+    names = gdf.loc[~gdf["name_norm"].str.startswith("gridpoint", na=False), "name_norm"]
+    return {name for name in names if name}
+
+
+def load_expected_map_assignments() -> Dict[str, Dict[str, Set[int]]]:
+    """Load participant-map assignments from the Analysis spreadsheets."""
+    workbook_by_group = {
+        "blind": ANALYSIS_DIR / "Blind_Participants_Data.xlsx",
+        "sighted": ANALYSIS_DIR / "Sighted_Participants_Data.xlsx",
+    }
+    assignments: Dict[str, Dict[str, Set[int]]] = {"blind": {}, "sighted": {}}
+
+    for group, workbook in workbook_by_group.items():
+        if not workbook.exists():
+            continue
+        xls = pd.ExcelFile(workbook)
+        sheet_name = next(
+            (name for name in ("Map Reproduction Scores", "Reproduction Results") if name in xls.sheet_names),
+            None,
+        )
+        if sheet_name is None:
+            raise ValueError(f"{workbook} must include a Map Reproduction Scores or Reproduction Results sheet")
+
+        sheet = pd.read_excel(workbook, sheet_name=sheet_name)
+        if "Participant" not in sheet.columns or "Map" not in sheet.columns:
+            raise ValueError(f"{workbook} must include Participant and Map columns")
+
+        for _, row in sheet.iterrows():
+            participant = normalize_participant_id(row.get("Participant"))
+            map_number = parse_map_number(row.get("Map"))
+            if participant is None or map_number is None:
+                continue
+            assignments[group].setdefault(participant, set()).add(map_number)
+
+    return assignments
+
+
+def build_baseline_name_signatures() -> Dict[int, Set[str]]:
+    """Build content fingerprints from baseline non-grid feature names."""
+    signatures: Dict[int, Set[str]] = {}
+    for baseline_file in sorted(BASELINE_DIR.glob("baseline_map_*.geojson")):
+        map_number = infer_map_number(baseline_file)
+        if map_number is None:
+            continue
+        signatures[map_number] = non_grid_feature_names(load_geojson_features(baseline_file))
+    return signatures
+
+
+def infer_content_map_number(feature_names: Set[str], signatures: Dict[int, Set[str]]) -> Optional[int]:
+    """Choose the baseline map whose non-grid names best match the participant file."""
+    if not feature_names:
+        return None
+
+    best_map = None
+    best_overlap = 0
+    for map_number, signature in signatures.items():
+        overlap = len(feature_names & signature)
+        if overlap > best_overlap:
+            best_map = map_number
+            best_overlap = overlap
+        elif overlap == best_overlap:
+            best_map = None
+
+    return best_map if best_overlap > 0 else None
+
+
+def content_validation_note(expected_map: int, guessed_map: Optional[int]) -> str:
+    """Human-readable diagnostic for cross-map content checks."""
+    if guessed_map is None:
+        return "Unable to infer content map from feature names."
+    if guessed_map != expected_map:
+        return f"WARNING: feature names look most like Map {guessed_map}, not Map {expected_map}."
+    return "Feature names match expected map signature."
 
 
 def apply_preset_exclusions(gdf: gpd.GeoDataFrame, map_number: int) -> gpd.GeoDataFrame:
@@ -191,12 +286,16 @@ def build_description_row() -> Dict[str, str]:
         "Group": "Scoring metadata",
         "Participant": "Folder participant id (p#)",
         "Map": "Baseline map number used for comparison",
+        "Expected Maps": "Map number(s) expected from the Analysis workbook",
+        "Source File": "GeoJSON file scored or audited",
         "Reference Features": "Count of baseline features after preset-object exclusions",
         "Participant Features": "Count of participant features after the same exclusions",
         "Matched Features": "Number of baseline-participant feature pairs matched by name/type then centroid proximity",
         "Missing Features": "Missing baseline features = Reference Features - Matched Features (baseline objects with no acceptable match)",
         "Extra Features": "Participant Features - Matched Features (participant objects not matched to baseline)",
         "Missing/Extra Notes": "Explanation of why missing/extra can happen (e.g., mislabel, misplaced object, type mismatch)",
+        "Content Map Guess": "Baseline map whose feature-name signature best matches the participant file",
+        "Content Validation": "Warning when file contents appear to belong to a different map than the evaluated baseline",
         "Name/Type": "matched exact (name + geometry type) / Reference Features",
         "Shape": "1 - min(HausdorffDistance / map diagonal, 1)",
         "Size": "Polygon: area ratio similarity; Line: total length ratio similarity; Point: neutral size",
@@ -215,12 +314,20 @@ class AnalysisContext:
     group: str
     participant: str
     map_number: int
+    expected_maps: Set[int]
     baseline_file: Path
     participant_file: Path
+    content_map_guess: Optional[int]
 
 
-def collect_participant_maps() -> List[AnalysisContext]:
-    """Discover all participant map files that can be scored."""
+def collect_participant_maps(
+    expected_assignments: Optional[Dict[str, Dict[str, Set[int]]]] = None,
+) -> List[AnalysisContext]:
+    """Discover participant map files listed in the Analysis ground truth."""
+    if expected_assignments is None:
+        expected_assignments = load_expected_map_assignments()
+    baseline_signatures = build_baseline_name_signatures()
+
     contexts: List[AnalysisContext] = []
     for group, group_dir in (("blind", BLIND_DIR), ("sighted", SIGHTED_DIR)):
         if not group_dir.exists():
@@ -228,20 +335,26 @@ def collect_participant_maps() -> List[AnalysisContext]:
         for participant_dir in sorted(group_dir.glob("p*")):
             if not participant_dir.is_dir():
                 continue
+            expected_maps = set(expected_assignments.get(group, {}).get(participant_dir.name, set()))
             for geojson_file in sorted(participant_dir.glob("*.geojson")):
                 map_number = infer_map_number(geojson_file)
                 if map_number is None:
                     continue
+                if map_number not in expected_maps:
+                    continue
                 baseline_file = BASELINE_DIR / f"baseline_map_{map_number}.geojson"
                 if baseline_file.exists():
-                    # Keep one context per participant-map file.
+                    raw_participant = load_geojson_features(geojson_file)
+                    content_guess = infer_content_map_number(non_grid_feature_names(raw_participant), baseline_signatures)
                     contexts.append(
                         AnalysisContext(
                             group=group,
                             participant=participant_dir.name,
                             map_number=map_number,
+                            expected_maps=expected_maps,
                             baseline_file=baseline_file,
                             participant_file=geojson_file,
+                            content_map_guess=content_guess,
                         )
                     )
     return contexts
@@ -249,8 +362,10 @@ def collect_participant_maps() -> List[AnalysisContext]:
 
 def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
     """Run full scoring workflow for one participant-map pair."""
+    raw_participant = load_geojson_features(ctx.participant_file)
+
     baseline = apply_preset_exclusions(load_geojson_features(ctx.baseline_file), ctx.map_number)
-    participant = apply_preset_exclusions(load_geojson_features(ctx.participant_file), ctx.map_number)
+    participant = apply_preset_exclusions(raw_participant, ctx.map_number)
 
     matched_pairs, missing_indices, extra_indices = match_features(baseline, participant)
     ref_count = len(baseline)
@@ -303,6 +418,8 @@ def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
         "Group": ctx.group,
         "Participant": ctx.participant,
         "Map": ctx.map_number,
+        "Expected Maps": ", ".join(map(str, sorted(ctx.expected_maps))) if ctx.expected_maps else "",
+        "Source File": str(ctx.participant_file.relative_to(ctx.participant_file.parents[1])),
         "Reference Features": ref_count,
         "Participant Features": participant_count,
         "Matched Features": len(matched_pairs),
@@ -314,7 +431,9 @@ def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
             missing_names=[str(baseline.loc[i, "feature_name"]) for i in missing_indices],
             extra_names=[str(participant.loc[i, "feature_name"]) for i in extra_indices],
         ),
-        "Name/Type": round((exact_name_type / ref_count) if ref_count else 1.0, 3),
+        "Content Map Guess": f"Map {ctx.content_map_guess}" if ctx.content_map_guess is not None else "Unknown",
+        "Content Validation": content_validation_note(ctx.map_number, ctx.content_map_guess),
+        "Name/Type": round((exact_name_type / ref_count) if ref_count else 0.0, 3),
         "Shape": round(safe_mean(shape_scores), 3),
         "Size": round(safe_mean(size_scores), 3),
         "Orientation": round(safe_mean(orientation_scores), 3),
@@ -343,15 +462,15 @@ def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
 
 def run_analysis() -> pd.DataFrame:
     """Run full dataset analysis and persist CSV/XLSX reports."""
-    rows = [analyze_single_context(ctx) for ctx in collect_participant_maps()]
+    expected_assignments = load_expected_map_assignments()
+    contexts = collect_participant_maps(expected_assignments)
+    rows = [analyze_single_context(ctx) for ctx in contexts]
     # Sort output for stable review/diff behavior.
     rows = sorted(rows, key=lambda r: (r["Group"], int(str(r["Participant"]).lstrip("p")), r["Map"]))
-
     score_df = pd.DataFrame(rows)
-    # Excel output must have two sheets: blind and sighted.
     with pd.ExcelWriter(RESULTS_XLSX, engine="openpyxl") as writer:
         for group_name in ("blind", "sighted"):
-            group_df = score_df[score_df["Group"] == group_name].copy()
+            group_df = score_df[score_df["Group"] == group_name].copy() if not score_df.empty else pd.DataFrame()
             if not group_df.empty:
                 group_df["__participant_num"] = group_df["Participant"].map(lambda v: int(str(v).lstrip("p")))
                 group_df = group_df.sort_values(by=["__participant_num", "Map"]).drop(columns=["__participant_num"])
