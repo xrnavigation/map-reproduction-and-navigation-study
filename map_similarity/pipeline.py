@@ -296,7 +296,7 @@ def build_description_row() -> Dict[str, str]:
         "Missing/Extra Notes": "Explanation of why missing/extra can happen (e.g., mislabel, misplaced object, type mismatch)",
         "Content Map Guess": "Baseline map whose feature-name signature best matches the participant file",
         "Content Validation": "Warning when file contents appear to belong to a different map than the evaluated baseline",
-        "Name/Type": "matched exact (name + geometry type) / Reference Features",
+        "Name/Type": "matched exact (name + geometry type) / (Reference Features + Extra Features)",
         "Shape": "1 - min(HausdorffDistance / map diagonal, 1)",
         "Size": "Polygon: area ratio similarity; Line: total length ratio similarity; Point: neutral size",
         "Orientation": "1 - (orientation mismatch from north in degrees / 180), using 1..360 angle scale",
@@ -336,22 +336,49 @@ def collect_participant_maps(
             if not participant_dir.is_dir():
                 continue
             expected_maps = set(expected_assignments.get(group, {}).get(participant_dir.name, set()))
-            for geojson_file in sorted(participant_dir.glob("*.geojson")):
-                map_number = infer_map_number(geojson_file)
-                if map_number is None:
+            participant_files = {
+                map_number: geojson_file
+                for geojson_file in sorted(participant_dir.glob("*.geojson"))
+                if (map_number := infer_map_number(geojson_file)) is not None
+            }
+            content_guess_by_file = {
+                geojson_file: infer_content_map_number(
+                    non_grid_feature_names(load_geojson_features(geojson_file)),
+                    baseline_signatures,
+                )
+                for geojson_file in participant_files.values()
+            }
+
+            selected_files: Dict[int, Path] = {}
+            used_files: Set[Path] = set()
+            for map_number in sorted(expected_maps):
+                if map_number in participant_files:
+                    geojson_file = participant_files[map_number]
+                    selected_files[map_number] = geojson_file
+                    used_files.add(geojson_file)
                     continue
-                if map_number not in expected_maps:
-                    continue
+
+                matching_content_files = [
+                    geojson_file
+                    for geojson_file, content_guess in content_guess_by_file.items()
+                    if geojson_file not in used_files and content_guess == map_number
+                ]
+                if len(matching_content_files) == 1:
+                    geojson_file = matching_content_files[0]
+                    selected_files[map_number] = geojson_file
+                    used_files.add(geojson_file)
+
+            active_expected_maps = set(selected_files)
+            for map_number, geojson_file in sorted(selected_files.items()):
                 baseline_file = BASELINE_DIR / f"baseline_map_{map_number}.geojson"
                 if baseline_file.exists():
-                    raw_participant = load_geojson_features(geojson_file)
-                    content_guess = infer_content_map_number(non_grid_feature_names(raw_participant), baseline_signatures)
+                    content_guess = content_guess_by_file.get(geojson_file)
                     contexts.append(
                         AnalysisContext(
                             group=group,
                             participant=participant_dir.name,
                             map_number=map_number,
-                            expected_maps=expected_maps,
+                            expected_maps=active_expected_maps,
                             baseline_file=baseline_file,
                             participant_file=geojson_file,
                             content_map_guess=content_guess,
@@ -406,13 +433,14 @@ def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
         )
         topology_scores.append(1.0 if topology_relation(bg1, bg2) == topology_relation(pg1, pg2) else 0.0)
 
-    # Name/Type rewards exact semantic match within aligned geometry class.
+    # Name/Type rewards exact semantic match and penalizes unmatched extra features.
     exact_name_type = sum(
         1
         for b_idx, p_idx in matched_pairs
         if baseline.loc[b_idx, "name_norm"] == participant.loc[p_idx, "name_norm"]
         and baseline.loc[b_idx, "geom_type"] == participant.loc[p_idx, "geom_type"]
     )
+    name_type_denominator = ref_count + len(extra_indices)
 
     row = {
         "Group": ctx.group,
@@ -433,7 +461,7 @@ def analyze_single_context(ctx: AnalysisContext) -> Dict[str, object]:
         ),
         "Content Map Guess": f"Map {ctx.content_map_guess}" if ctx.content_map_guess is not None else "Unknown",
         "Content Validation": content_validation_note(ctx.map_number, ctx.content_map_guess),
-        "Name/Type": round((exact_name_type / ref_count) if ref_count else 0.0, 3),
+        "Name/Type": round((exact_name_type / name_type_denominator) if name_type_denominator else 0.0, 3),
         "Shape": round(safe_mean(shape_scores), 3),
         "Size": round(safe_mean(size_scores), 3),
         "Orientation": round(safe_mean(orientation_scores), 3),
