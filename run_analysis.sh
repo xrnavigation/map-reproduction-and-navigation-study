@@ -2,7 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_DIR="$ROOT_DIR/.venv"
+
+# A venv created by Windows Python is unusable from Linux/WSL (and vice
+# versa), so give each platform its own directory.
+case "$(uname -s)" in
+  Linux*) VENV_DIR="$ROOT_DIR/.venv-linux" ;;
+  *)      VENV_DIR="$ROOT_DIR/.venv" ;;
+esac
 
 cd "$ROOT_DIR"
 
@@ -18,9 +24,12 @@ else
   exit 1
 fi
 
-if [ ! -d "$VENV_DIR" ]; then
+# (Re)create the venv if missing or broken (e.g. a partially created one
+# left behind when python3-venv wasn't installed yet).
+if [ ! -f "$VENV_DIR/Scripts/activate" ] && [ ! -f "$VENV_DIR/bin/activate" ]; then
   echo "[setup] Creating virtual environment..."
-  $PYTHON -m venv "$VENV_DIR"
+  rm -rf "$VENV_DIR"
+  $PYTHON -m venv "$VENV_DIR" || { rm -rf "$VENV_DIR"; exit 1; }
 fi
 
 # Windows venvs use Scripts/, Unix venvs use bin/
