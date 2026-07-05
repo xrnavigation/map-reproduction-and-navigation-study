@@ -1,4 +1,7 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import geopandas as gpd
 from shapely.geometry import LineString, Polygon, Point
@@ -11,6 +14,8 @@ from audiom_map_similarity_analysis import (
     explain_missing_extra,
     apply_preset_exclusions,
 )
+from map_similarity.metrics import safe_mean
+from map_similarity.pipeline import AnalysisContext, analyze_single_context, collect_participant_maps
 
 
 class MapSimilarityTests(unittest.TestCase):
@@ -43,6 +48,7 @@ class MapSimilarityTests(unittest.TestCase):
         self.assertIn("Shape", row)
         self.assertIn("orientation mismatch", row["Orientation"].lower())
         self.assertIn("missing", row["Missing Features"].lower())
+        self.assertIn("extra features", row["Name/Type"].lower())
 
     def test_explain_missing_extra_reason(self):
         note = explain_missing_extra(
@@ -53,6 +59,9 @@ class MapSimilarityTests(unittest.TestCase):
         )
         self.assertIn("one baseline feature was not matched", note.lower())
         self.assertIn("one participant feature was unmatched", note.lower())
+
+    def test_safe_mean_empty_defaults_to_zero(self):
+        self.assertEqual(safe_mean([]), 0.0)
 
     def test_apply_preset_exclusions_map2(self):
         rows = [
@@ -71,6 +80,174 @@ class MapSimilarityTests(unittest.TestCase):
         self.assertNotIn("flagpole", names)
         self.assertNotIn("elevator", names)
         self.assertEqual(names.count("walkway"), 1)
+
+    def test_apply_preset_exclusions_map3(self):
+        rows = [
+            {"name_norm": "dancestudio", "geom_type": "Polygon", "centroid_y": 5.0},
+            {"name_norm": "watermachine", "geom_type": "Point", "centroid_y": 4.0},
+            {"name_norm": "walkway", "geom_type": "LineString", "centroid_y": 10.0},
+            {"name_norm": "walkway", "geom_type": "LineString", "centroid_y": 6.0},
+            {"name_norm": "walkway", "geom_type": "LineString", "centroid_y": 1.0},
+            {"name_norm": "frontdesk", "geom_type": "Polygon", "centroid_y": 2.0},
+        ]
+        gdf = gpd.GeoDataFrame(rows, geometry=[Point(0, 0)] * len(rows))
+        filtered = apply_preset_exclusions(gdf, map_number=3)
+        names = list(filtered["name_norm"])
+        self.assertNotIn("dancestudio", names)
+        self.assertNotIn("watermachine", names)
+        self.assertEqual(names.count("walkway"), 1)
+        self.assertIn("frontdesk", names)
+
+    def test_collect_participant_maps_uses_expected_assignments(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blind_dir = root / "blind_participants"
+            sighted_dir = root / "sighted_participants"
+            baseline_dir = root / "baseline_maps"
+            blind_p1 = blind_dir / "p1"
+            sighted_p6 = sighted_dir / "p6"
+            blind_p1.mkdir(parents=True)
+            sighted_p6.mkdir(parents=True)
+            baseline_dir.mkdir()
+
+            for map_number in (1, 2, 3):
+                baseline = f'{{"type":"FeatureCollection","features":[],"baseline":{map_number}}}'
+                participant = f'{{"type":"FeatureCollection","features":[],"participant":{map_number}}}'
+                (baseline_dir / f"baseline_map_{map_number}.geojson").write_text(baseline, encoding="utf-8")
+                (blind_p1 / f"Blind_p1_Spatial_Knowledge_map_{map_number}.geojson").write_text(
+                    participant, encoding="utf-8"
+                )
+                (sighted_p6 / f"Sighted_p6_Spatial_Knowledge_map_{map_number}.geojson").write_text(
+                    participant, encoding="utf-8"
+                )
+
+            assignments = {
+                "blind": {"p1": {2}},
+                "sighted": {"p6": {2, 3}},
+            }
+            with patch("map_similarity.pipeline.BLIND_DIR", blind_dir), patch(
+                "map_similarity.pipeline.SIGHTED_DIR", sighted_dir
+            ), patch("map_similarity.pipeline.BASELINE_DIR", baseline_dir):
+                contexts = collect_participant_maps(assignments)
+
+        scored = sorted((ctx.group, ctx.participant, ctx.map_number) for ctx in contexts)
+        self.assertEqual(scored, [("blind", "p1", 2), ("sighted", "p6", 2), ("sighted", "p6", 3)])
+
+    def test_collect_participant_maps_excludes_missing_geojson_from_active_expected_maps(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sighted_dir = root / "sighted_participants"
+            baseline_dir = root / "baseline_maps"
+            sighted_p12 = sighted_dir / "p12"
+            sighted_p12.mkdir(parents=True)
+            baseline_dir.mkdir()
+
+            for map_number in (2, 3):
+                baseline = f'{{"type":"FeatureCollection","features":[],"baseline":{map_number}}}'
+                (baseline_dir / f"baseline_map_{map_number}.geojson").write_text(baseline, encoding="utf-8")
+
+            participant = '{"type":"FeatureCollection","features":[],"participant":2}'
+            (sighted_p12 / "Sighted_p12_Spatial_Knowledge_map_2.geojson").write_text(participant, encoding="utf-8")
+
+            assignments = {"blind": {}, "sighted": {"p12": {2, 3}}}
+            with patch("map_similarity.pipeline.BLIND_DIR", root / "blind_participants"), patch(
+                "map_similarity.pipeline.SIGHTED_DIR", sighted_dir
+            ), patch("map_similarity.pipeline.BASELINE_DIR", baseline_dir):
+                contexts = collect_participant_maps(assignments)
+
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0].map_number, 2)
+        self.assertEqual(contexts[0].expected_maps, {2})
+
+    def test_collect_participant_maps_can_match_expected_map_by_content_signature(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            sighted_dir = root / "sighted_participants"
+            baseline_dir = root / "baseline_maps"
+            sighted_p8 = sighted_dir / "p8"
+            sighted_p8.mkdir(parents=True)
+            baseline_dir.mkdir()
+
+            baseline_map_2 = (
+                '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Target Two"},'
+                '"geometry":{"type":"Point","coordinates":[0,0]}}]}'
+            )
+            baseline_map_3 = (
+                '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Target Three"},'
+                '"geometry":{"type":"Point","coordinates":[1,1]}}]}'
+            )
+            (baseline_dir / "baseline_map_2.geojson").write_text(baseline_map_2, encoding="utf-8")
+            (baseline_dir / "baseline_map_3.geojson").write_text(baseline_map_3, encoding="utf-8")
+
+            participant_map_1 = (
+                '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Target Two"},'
+                '"geometry":{"type":"Point","coordinates":[0,0]}}]}'
+            )
+            (sighted_p8 / "Sighted_p8_Spatial_Knowledge_map_1.geojson").write_text(
+                participant_map_1,
+                encoding="utf-8",
+            )
+
+            assignments = {"blind": {}, "sighted": {"p8": {2, 3}}}
+            with patch("map_similarity.pipeline.BLIND_DIR", root / "blind_participants"), patch(
+                "map_similarity.pipeline.SIGHTED_DIR", sighted_dir
+            ), patch("map_similarity.pipeline.BASELINE_DIR", baseline_dir):
+                contexts = collect_participant_maps(assignments)
+
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0].map_number, 2)
+        self.assertEqual(contexts[0].participant_file.name, "Sighted_p8_Spatial_Knowledge_map_1.geojson")
+        self.assertEqual(contexts[0].content_map_guess, 2)
+
+    def test_extra_features_reduce_accuracy(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            baseline_file = root / "baseline_map_2.geojson"
+            participant_dir = root / "sighted_participants" / "p1"
+            participant_dir.mkdir(parents=True)
+            participant_file = participant_dir / "Sighted_p1_Spatial_Knowledge_map_2.geojson"
+
+            baseline_file.write_text(
+                """
+                {
+                  "type": "FeatureCollection",
+                  "features": [
+                    {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [0, 0]}},
+                    {"type": "Feature", "properties": {"name": "B"}, "geometry": {"type": "Point", "coordinates": [10, 0]}}
+                  ]
+                }
+                """,
+                encoding="utf-8",
+            )
+            participant_file.write_text(
+                """
+                {
+                  "type": "FeatureCollection",
+                  "features": [
+                    {"type": "Feature", "properties": {"name": "A"}, "geometry": {"type": "Point", "coordinates": [0, 0]}},
+                    {"type": "Feature", "properties": {"name": "B"}, "geometry": {"type": "Point", "coordinates": [10, 0]}},
+                    {"type": "Feature", "properties": {"name": "C"}, "geometry": {"type": "Point", "coordinates": [20, 0]}}
+                  ]
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            row = analyze_single_context(
+                AnalysisContext(
+                    group="sighted",
+                    participant="p1",
+                    map_number=2,
+                    expected_maps={2},
+                    baseline_file=baseline_file,
+                    participant_file=participant_file,
+                    content_map_guess=2,
+                )
+            )
+
+        self.assertEqual(row["Extra Features"], 1)
+        self.assertEqual(row["Name/Type"], 0.667)
+        self.assertLess(row["Accuracy %"], 100.0)
 
 
 if __name__ == "__main__":
